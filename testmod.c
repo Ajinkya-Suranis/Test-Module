@@ -17,35 +17,78 @@
 #include <linux/fs.h>
 #include <linux/fcntl.h>
 #include <linux/version.h>
+#include <linux/slab.h>
+
+/*
+ * This kernel module tries to intercept the 'open'
+ * system call and tries to deny access to 'filename'
+ * defined below.
+ * This 'filename' is a configuration parameter and
+ * it can be passed to 'insmod' while loading
+ * the module.
+ * Please refer to the README in this source tree
+ * for more information on how to specify configuration
+ * parameter during 'insmod'.
+ */
 
 #define	KMALLOC		kmalloc
 #define	KFREE		kfree
 #define	FILENAME	"/file1"
 #define	VERSION_PATH	"/proc/version"
 #define SYSMAP_PATH	"/boot/System.map-"
+#define	MODULE_PARAM	module_param
 #define	MAXPATHLEN	256
 #define	BUFSIZE		1024
 #define	MAXLEN		256
 
+/*
+ * By default (when no configuration parameter is specified
+ * along with 'insmod'), the file name is "/file1".
+ */
+
+char	*filename = FILENAME;
+
+MODULE_PARAM(filename, charp, S_IRUSR | S_IWUSR);
+MODULE_PARM_DESC(filename, "File name used to prevent access.");
+
+/*
+ * Pointer to the system call table.
+ * It is obtained dynamically in get_syscall_table_addr().
+ */
+
 unsigned long *syscall_table = NULL;
- 
+
+/*
+ * Pointer to the original open system call funcion.
+ */
+
 asmlinkage int (*original_open)(const char __user *filename, int flags, int mode);
- 
-asmlinkage int open_wrapper(const char __user *filename, int flags, int mode)
+
+/*
+ * This function is called when 'open' system call is executed.
+ * It first gets the inode pointers corresponding to the input file
+ * path (on which 'open' is called) and the 'filename' using
+ * 'kernel_path()' function.
+ * After comparing the two inode pointers, if they turn out to be
+ * same, then -EACCES is returned.
+ * If they don't match, then original system call function is called.
+ */
+
+asmlinkage int open_wrapper(const char __user *fname, int flags, int mode)
 {
 	struct inode		*ip, *target_ip;
 	struct path		pth1, pth2;
 	mm_segment_t		fs;
 	int			error;
 
-	error = kern_path(filename, LOOKUP_FOLLOW, &pth1);
+	error = kern_path(fname, LOOKUP_FOLLOW, &pth1);
 
 	if (!error) {
 		ip = pth1.dentry->d_inode;
 
 		fs = get_fs();
 		set_fs(get_fs());
-		error = kern_path(FILENAME, LOOKUP_FOLLOW | LOOKUP_REVAL, &pth2);
+		error = kern_path(filename, LOOKUP_FOLLOW | LOOKUP_REVAL, &pth2);
 
 		set_fs(fs);
 		if (!error) {
@@ -56,8 +99,16 @@ asmlinkage int open_wrapper(const char __user *filename, int flags, int mode)
 		}
 	}
  
-	return (*original_open)(filename, flags, mode);
+	return (*original_open)(fname, flags, mode);
 }
+
+/*
+ * In order to get the system call table address,
+ * we need to first get the version number from
+ * '/proc/version' file.
+ * The below function reads this file using 'vfs_read()'
+ * and returns the version string to the caller.
+ */
 
 char *
 read_version_file(
@@ -85,6 +136,22 @@ read_version_file(
 	return version;
 }
 
+/*
+ * The following function reads the system map file
+ * ('/boot/System.map-<version>) to get the address
+ * of 'sys_call_table' global.
+ * The input is kernel version string obtained from
+ * 'read_version_file()'.
+ * It first opens the system map file using 'filp_open()'
+ * and reads it line-by-line.
+ * Each line is checked whether it contains
+ * 'sys_call_table'. Once it is found, it's converted
+ * to unsigned long type and assigned to 'syscall_table'.
+ *
+ * This 'syscall_table' will be further used to index to
+ * according to system call number (e.g. __NR_open).
+ */
+
 static int
 read_sysmap_file(
 	char		*version)
@@ -110,9 +177,7 @@ read_sysmap_file(
 	strncpy(fname, SYSMAP_PATH, strlen(SYSMAP_PATH));
 	strncat(fname, version, strlen(version));
 
-
 	fp = filp_open(fname, O_RDONLY, 0);
-
 	if (fp == NULL || IS_ERR(fp)) {
 		KFREE(buf);
 		KFREE(fname);
@@ -182,6 +247,21 @@ get_syscall_table_addr(void)
 	return 0;
 }
 
+/*
+ * This is module entry function which is executed
+ * when a module is loaded.
+ * It first changes the permission to write permission
+ * to the kernel address space using 'write_cr0()',
+ * so that we can make changes to the memory space of
+ * 'sys_call_table' for the purpose of changing the
+ * entry point of 'open' system call.
+ * It undoes this operation at the end phase of module 
+ * loading.
+ * We also need to change the content of one register
+ * to enable us accessing kernel addresses in the
+ * routines which expect user addresses (e.g. vfs_read)
+ * using set_fs().
+ */
 
 static int modinit(void)
 {
@@ -190,13 +270,13 @@ static int modinit(void)
 
 	printk(KERN_ALERT "New module loading..\n");
  
-	write_cr0 (read_cr0 () & (~0x10000));
+	write_cr0(read_cr0() & (~0x10000));
 
 	fs = get_fs();
 	set_fs(KERNEL_DS);
 	if((error = get_syscall_table_addr()) != 0) {
 		set_fs(fs);
-		write_cr0 (read_cr0 () | 0x10000);
+		write_cr0(read_cr0() | 0x10000);
 		return error;
 	}
  
@@ -204,21 +284,29 @@ static int modinit(void)
 	syscall_table[__NR_open] = open_wrapper;
 
 	set_fs(fs);
-	write_cr0 (read_cr0 () | 0x10000);
+	write_cr0(read_cr0() | 0x10000);
  
 	return 0;
 }
 
+/*
+ * Module unload function.
+ * It undoes all the operations performed by module load
+ * function (modinit()).
+ * It restores the original 'open' system call function
+ * in 'sys_call_table'.
+ */
+
 static void modexit(void)
 {
-	write_cr0 (read_cr0 () & (~ 0x10000));
+	write_cr0(read_cr0() & (~0x10000));
 
 	syscall_table[__NR_open] = original_open;
 
-	write_cr0 (read_cr0 () | 0x10000);
- 
-	printk(KERN_ALERT "MODULE EXIT\n");
- 
+	write_cr0(read_cr0() | 0x10000);
+
+	printk(KERN_ALERT "Module exiting..\n");
+
 	return;
 }
  
